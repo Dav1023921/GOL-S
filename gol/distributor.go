@@ -1,5 +1,13 @@
 package gol
 
+import (
+	"fmt"
+	"log"
+	"strconv"
+	"time"
+	"uk.ac.bris.cs/gameoflife/util"
+)
+
 type distributorChannels struct {
 	events     chan<- Event
 	ioCommand  chan<- ioCommand
@@ -9,7 +17,18 @@ type distributorChannels struct {
 	ioInput    <-chan uint8
 }
 
-func countAliveNeighbors(p Params, world [][]byte, x, y int) int {
+func makeImmutableMatrix(matrix [][]uint8) func(y, x int) uint8 {
+	return func(y, x int) uint8 {
+		return matrix[y][x]
+	}
+}
+
+func worker(p Params, data func(y, x int) uint8, out chan<- [][]byte, startHeight, endHeight int) {
+	nextState := calculateNextState(p, data, startHeight, endHeight)
+	out <- nextState
+}
+
+func countAliveNeighbors(p Params, data func(y, x int) uint8, x, y int) int {
 	aliveNeighbors := 0
 	for i := -1; i <= 1; i++ {
 		for j := -1; j <= 1; j++ {
@@ -18,7 +37,7 @@ func countAliveNeighbors(p Params, world [][]byte, x, y int) int {
 			}
 			neighborX := (x + i + p.ImageWidth) % p.ImageWidth
 			neighborY := (y + j + p.ImageHeight) % p.ImageHeight
-			if world[neighborY][neighborX] == 255 {
+			if data(neighborY, neighborX) == 255 {
 				aliveNeighbors++
 			}
 		}
@@ -26,32 +45,32 @@ func countAliveNeighbors(p Params, world [][]byte, x, y int) int {
 	return aliveNeighbors
 }
 
-func calculateNextState(p Params, world [][]byte) [][]byte {
-	newWorld := make([][]byte, p.ImageHeight)
-	for i := range newWorld {
-		newWorld[i] = make([]byte, p.ImageWidth)
+func calculateNextState(p Params, data func(y, x int) uint8, startHeight, endHeight int) [][]byte {
+	newSection := make([][]byte, endHeight-startHeight)
+	for i := range newSection {
+		newSection[i] = make([]byte, p.ImageWidth)
 	}
 
-	for y := 0; y < p.ImageHeight; y++ {
+	for y := startHeight; y < endHeight; y++ {
 		for x := 0; x < p.ImageWidth; x++ {
-			aliveNeighbors := countAliveNeighbors(p, world, x, y)
-			if world[y][x] == 255 {
+			aliveNeighbors := countAliveNeighbors(p, data, x, y)
+			if data(y, x) == 255 {
 				if aliveNeighbors < 2 || aliveNeighbors > 3 {
-					newWorld[y][x] = 0
+					newSection[y-startHeight][x] = 0
 				} else {
-					newWorld[y][x] = 255
+					newSection[y-startHeight][x] = 255
 				}
 			} else {
 				if aliveNeighbors == 3 {
-					newWorld[y][x] = 255
+					newSection[y-startHeight][x] = 255
 				} else {
-					newWorld[y][x] = 0
+					newSection[y-startHeight][x] = 0
 				}
 			}
 		}
 	}
 
-	return newWorld
+	return newSection
 }
 
 func calculateAliveCells(p Params, world [][]byte) []util.Cell {
@@ -91,16 +110,68 @@ func distributor(p Params, c distributorChannels) {
 		}
 	}
 
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	done := make(chan bool)
+
 	turn := 0
 	c.events <- StateChange{turn, Executing}
 
+	outChannels := make([]chan [][]byte, p.Threads)
+	for i := 0; i < p.Threads; i++ {
+		outChannels[i] = make(chan [][]byte)
+	}
+
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				aliveCells := calculateAliveCells(p, world)
+				fmt.Printf("Alive cells: %d\n", len(aliveCells))
+				c.events <- AliveCellsCount{turn, len(aliveCells)}
+			case <-done:
+				return
+			}
+		}
+	}()
+
 	// TODO: Execute all turns of the Game of Life.
-	for turn = 0; turn < p.Turns; turn++ {
-		world = calculateNextState(p, world)
+	if p.Threads == 1 {
+		for turn = 0; turn < p.Turns; turn++ {
+			immutableData := makeImmutableMatrix(world)
+			world = calculateNextState(p, immutableData, 0, p.ImageHeight)
+		}
+	} else {
+		for turn = 0; turn < p.Turns; turn++ {
+			immutableData := makeImmutableMatrix(world)
+			newData := [][]byte{}
+
+			rowsAThread := p.ImageHeight / p.Threads
+			remainderRows := p.ImageHeight % p.Threads
+
+			for i := 0; i < p.Threads; i++ {
+				start := i * rowsAThread
+				end := start + rowsAThread
+				if i == p.Threads-1 { // Last thread gets the remaining rows
+					end += remainderRows
+				}
+				go worker(p, immutableData, outChannels[i], start, end)
+			}
+
+			for i := 0; i < p.Threads; i++ {
+				newData = append(newData, <-outChannels[i]...)
+			}
+
+			world = newData
+
+		}
+
 	}
 
 	// TODO: Report the final state using FinalTurnCompleteEvent.
 	c.events <- FinalTurnComplete{CompletedTurns: turn, Alive: calculateAliveCells(p, world)}
+	done <- true
 
 	// Make sure that the Io has finished any output before exiting.
 	c.ioCommand <- ioCheckIdle
@@ -109,5 +180,6 @@ func distributor(p Params, c distributorChannels) {
 	c.events <- StateChange{turn, Quitting}
 
 	// Close the channel to stop the SDL goroutine gracefully. Removing may cause deadlock.
+	defer close(c.events)
 	close(c.events)
 }
