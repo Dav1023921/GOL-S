@@ -85,14 +85,28 @@ func calculateAliveCells(p Params, world [][]byte) []util.Cell {
 	return aliveCells
 }
 
+func saveCurrentState(p Params, world [][]byte, c distributorChannels) {
+	filename := strconv.Itoa(p.ImageWidth) + "x" + strconv.Itoa(p.ImageHeight) + "x" + strconv.Itoa(p.Turns)
+	c.ioCommand <- ioOutput
+	c.ioFilename <- filename
+	for y := 0; y < p.ImageHeight; y++ {
+		for x := 0; x < p.ImageWidth; x++ {
+			c.ioOutput <- world[y][x]
+		}
+	}
+	// Signal that the image output is complete
+	c.events <- ImageOutputComplete{CompletedTurns: p.Turns}
+}
+
 // distributor divides the work between workers and interacts with other goroutines.
-func distributor(p Params, c distributorChannels) {
+func distributor(p Params, c distributorChannels, keyPresses <-chan rune) {
 
 	// TODO: Create a 2D slice to store the world.
 	world := make([][]byte, p.ImageHeight)
 	for i := range world {
 		world[i] = make([]byte, p.ImageWidth)
 	}
+
 	//fmt.Println("Sending ioInput command")
 	c.ioCommand <- ioInput
 	var filename = strconv.Itoa(p.ImageWidth) + "x" + strconv.Itoa(p.ImageHeight)
@@ -123,6 +137,29 @@ func distributor(p Params, c distributorChannels) {
 		outChannels[i] = make(chan [][]byte)
 	}
 
+	var paused = false
+	var quit = false
+
+	go func() {
+		for key := range keyPresses {
+			switch key {
+			case 's': // Save the current state
+				saveCurrentState(p, world, c)
+				c.events <- ImageOutputComplete{CompletedTurns: turn}
+			case 'q': // Quit the program
+				quit = true
+			case 'p': // Pause the program
+				paused = !paused
+				if paused {
+					c.events <- StateChange{turn, Paused}
+				} else {
+					c.events <- StateChange{turn, Executing}
+				}
+
+			}
+		}
+	}()
+
 	go func() {
 		for {
 			select {
@@ -137,13 +174,17 @@ func distributor(p Params, c distributorChannels) {
 	}()
 
 	// TODO: Execute all turns of the Game of Life.
-	if p.Threads == 1 {
+	if p.Threads == 1 && !quit {
 		for turn = 0; turn < p.Turns; turn++ {
 			immutableData := makeImmutableMatrix(world)
 			world = calculateNextState(p, immutableData, 0, p.ImageHeight)
 		}
 	} else {
-		for turn = 0; turn < p.Turns; turn++ {
+		for turn = 0; turn < p.Turns && !quit; turn++ {
+			if paused {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
 			immutableData := makeImmutableMatrix(world)
 			newData := [][]byte{}
 
@@ -169,6 +210,15 @@ func distributor(p Params, c distributorChannels) {
 
 	}
 
+	if quit {
+		c.events <- FinalTurnComplete{CompletedTurns: turn, Alive: calculateAliveCells(p, world)}
+		saveCurrentState(p, world, c)
+		c.events <- ImageOutputComplete{CompletedTurns: turn}
+		c.events <- StateChange{turn, Quitting}
+	}
+
+	saveCurrentState(p, world, c)
+
 	// TODO: Report the final state using FinalTurnCompleteEvent.
 	c.events <- FinalTurnComplete{CompletedTurns: turn, Alive: calculateAliveCells(p, world)}
 	done <- true
@@ -181,5 +231,4 @@ func distributor(p Params, c distributorChannels) {
 
 	// Close the channel to stop the SDL goroutine gracefully. Removing may cause deadlock.
 	defer close(c.events)
-	close(c.events)
 }
