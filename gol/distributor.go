@@ -3,9 +3,10 @@ package gol
 import (
 	"fmt"
 	"log"
+	"net/rpc"
 	"strconv"
-	"sync"
 	"time"
+	"uk.ac.bris.cs/gameoflife/stubs"
 	"uk.ac.bris.cs/gameoflife/util"
 )
 
@@ -16,64 +17,6 @@ type distributorChannels struct {
 	ioFilename chan<- string
 	ioOutput   chan<- uint8
 	ioInput    <-chan uint8
-}
-
-func makeImmutableMatrix(matrix [][]uint8) func(y, x int) uint8 {
-	return func(y, x int) uint8 {
-		return matrix[y][x]
-	}
-}
-
-func worker(p Params, data func(y, x int) uint8, out chan<- [][]byte, startHeight, endHeight, turn int, c distributorChannels) {
-	nextState := calculateNextState(p, data, startHeight, endHeight, turn, c)
-	out <- nextState
-}
-
-func countAliveNeighbors(p Params, data func(y, x int) uint8, x, y int) int {
-	aliveNeighbors := 0
-	for i := -1; i <= 1; i++ {
-		for j := -1; j <= 1; j++ {
-			if i == 0 && j == 0 {
-				continue
-			}
-			neighborX := (x + i + p.ImageWidth) % p.ImageWidth
-			neighborY := (y + j + p.ImageHeight) % p.ImageHeight
-			if data(neighborY, neighborX) == 255 {
-				aliveNeighbors++
-			}
-		}
-	}
-	return aliveNeighbors
-}
-
-func calculateNextState(p Params, data func(y, x int) uint8, startHeight, endHeight, turn int, c distributorChannels) [][]byte {
-	newSection := make([][]byte, endHeight-startHeight)
-	for i := range newSection {
-		newSection[i] = make([]byte, p.ImageWidth)
-	}
-
-	for y := startHeight; y < endHeight; y++ {
-		for x := 0; x < p.ImageWidth; x++ {
-			aliveNeighbors := countAliveNeighbors(p, data, x, y)
-			if data(y, x) == 255 {
-				if aliveNeighbors < 2 || aliveNeighbors > 3 {
-					newSection[y-startHeight][x] = 0
-					c.events <- CellFlipped{turn, util.Cell{x, y}}
-				} else {
-					newSection[y-startHeight][x] = 255
-				}
-			} else {
-				if aliveNeighbors == 3 {
-					newSection[y-startHeight][x] = 255
-					c.events <- CellFlipped{turn, util.Cell{x, y}}
-				} else {
-					newSection[y-startHeight][x] = 0
-				}
-			}
-		}
-	}
-
-	return newSection
 }
 
 func calculateAliveCells(p Params, world [][]byte) []util.Cell {
@@ -88,20 +31,6 @@ func calculateAliveCells(p Params, world [][]byte) []util.Cell {
 	return aliveCells
 }
 
-func saveCurrentState(p Params, world [][]byte, c distributorChannels, turns int) {
-	filename := strconv.Itoa(p.ImageWidth) + "x" + strconv.Itoa(p.ImageHeight) + "x" + strconv.Itoa(turns)
-	c.ioCommand <- ioOutput
-	c.ioFilename <- filename
-	for y := 0; y < p.ImageHeight; y++ {
-		for x := 0; x < p.ImageWidth; x++ {
-			c.ioOutput <- world[y][x]
-		}
-	}
-	// Signal that the image output is complete
-	c.ioCommand <- ioCheckIdle
-	c.events <- ImageOutputComplete{turns, filename}
-}
-
 // distributor divides the work between workers and interacts with other goroutines.
 func distributor(p Params, c distributorChannels, keyPresses <-chan rune) {
 
@@ -110,13 +39,11 @@ func distributor(p Params, c distributorChannels, keyPresses <-chan rune) {
 	for i := range world {
 		world[i] = make([]byte, p.ImageWidth)
 	}
-
 	//fmt.Println("Sending ioInput command")
 	c.ioCommand <- ioInput
 	var filename = strconv.Itoa(p.ImageWidth) + "x" + strconv.Itoa(p.ImageHeight)
 	//fmt.Println("Sending filename to ioFilename channel")
 	c.ioFilename <- filename
-
 	//fmt.Println("Receiving world data")
 	for y := 0; y < p.ImageHeight; y++ {
 		for x := 0; x < p.ImageWidth; x++ {
@@ -131,116 +58,44 @@ func distributor(p Params, c distributorChannels, keyPresses <-chan rune) {
 		}
 	}
 
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	var quit, paused bool
-	done := make(chan bool)
-	aliveChan := make(chan int)
-	pauser := make(chan bool)
-	var m sync.Mutex
-
 	turn := 0
 	c.events <- StateChange{turn, Executing}
 
-	outChannels := make([]chan [][]byte, p.Threads)
-	for i := 0; i < p.Threads; i++ {
-		outChannels[i] = make(chan [][]byte)
-	}
+	// TODO: Execute all turns of the Game of Life.
+	server := "127.0.0.1:8030"
+	client, _ := rpc.Dial("tcp", server)
+	defer client.Close()
 
-	go func() {
-		for key := range keyPresses {
-			m.Lock()
-			switch key {
-			case 's': // Save the current state
-				saveCurrentState(p, world, c, turn)
-			case 'q': // Quit the program
-				quit = true
-				done <- true
-				<-aliveChan
-				c.events <- FinalTurnComplete{turn, calculateAliveCells(p, world)}
-				saveCurrentState(p, world, c, turn)
-				c.ioCommand <- ioCheckIdle
-				<-c.ioIdle
-				return
-			case 'p': // Pause the program
-				paused = !paused
-				if paused {
-					c.events <- StateChange{turn, Paused}
-				} else {
-					pauser <- true
-					c.events <- StateChange{turn, Executing}
-				}
-			}
-			m.Unlock()
-		}
-	}()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	done := make(chan bool)
 
 	go func() {
 		for {
 			select {
 			case <-ticker.C:
-				var aliveCells = <-aliveChan
-				fmt.Printf("Alive cells: %d\n", aliveCells)
-				c.events <- AliveCellsCount{turn, aliveCells}
-
-			case <-aliveChan:
-
+				request1 := stubs.Request{Grid: world, Height: p.ImageHeight, Width: p.ImageWidth, Turns: p.Turns}
+				response1 := new(stubs.Response)
+				fmt.Println("I have been run")
+				client.Call(stubs.Reporter, request1, response1)
+				c.events <- AliveCellsCount{turn, response1.Alive}
 			case <-done:
 				return
 			}
 		}
 	}()
 
-	// TODO: Execute all turns of the Game of Life.
-	for turn = 0; turn < p.Turns && !quit; turn++ {
-		if paused {
-			<-pauser
-		}
-		immutableData := makeImmutableMatrix(world)
-		if p.Threads == 1 {
-			world = calculateNextState(p, immutableData, 0, p.ImageHeight, turn, c)
-			aliveChan <- len(calculateAliveCells(p, world))
-			c.events <- TurnComplete{turn}
-		} else {
-			newData := [][]byte{}
-			rowsAThread := p.ImageHeight / p.Threads
-			remainderRows := p.ImageHeight % p.Threads
-			for i := 0; i < p.Threads; i++ {
-				start := i * rowsAThread
-				end := start + rowsAThread
-				if i == p.Threads-1 { // Last thread gets the remaining rows
-					end += remainderRows
-				}
-				go worker(p, immutableData, outChannels[i], start, end, turn, c)
-			}
-			for i := 0; i < p.Threads; i++ {
-				newData = append(newData, <-outChannels[i]...)
-			}
-			world = newData
-			aliveChan <- len(calculateAliveCells(p, world))
-			c.events <- TurnComplete{turn}
-		}
-	}
+	request := stubs.Request{Grid: world, Height: p.ImageHeight, Width: p.ImageWidth, Turns: p.Turns}
+	response := new(stubs.Response)
+	client.Call(stubs.ProcessGameOfLife, request, response)
 
-	saveCurrentState(p, world, c, turn)
-
-	if quit {
-		c.events <- StateChange{turn, Quitting}
-		return
-	}
-
-	// TODO: Report the final state using FinalTurnCompleteEvent.
-	c.events <- FinalTurnComplete{CompletedTurns: turn, Alive: calculateAliveCells(p, world)}
-	done <- true
-
-	// Make sure that the Io has finished any output before exiting.
-	c.ioCommand <- ioCheckIdle
-	<-c.ioIdle
+	fmt.Println("I have been run")
+	world = response.Grid
 
 	c.events <- StateChange{turn, Quitting}
-
+	c.events <- FinalTurnComplete{CompletedTurns: turn, Alive: calculateAliveCells(p, world)}
+	done <- true
 	// Close the channel to stop the SDL goroutine gracefully. Removing may cause deadlock.
-	defer close(c.events)
-	defer close(aliveChan)
+	close(c.events)
+
 }
